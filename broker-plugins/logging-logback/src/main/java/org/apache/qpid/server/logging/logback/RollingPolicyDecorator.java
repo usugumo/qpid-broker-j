@@ -108,9 +108,9 @@ public class RollingPolicyDecorator implements RollingPolicy
     @Override
     public void start()
     {
-        ScanTask task = createScanTaskAndCancelInProgress();
+        final ScanTask task = createScanTaskAndCancelInProgress();
         _decorated.start();
-        _executorService.execute(task);
+        task.run();
     }
 
     @Override

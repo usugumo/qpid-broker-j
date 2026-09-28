@@ -20,6 +20,7 @@
  */
 package org.apache.qpid.server.logging.logback;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -32,8 +33,11 @@ import static org.mockito.Mockito.when;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Queue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -42,11 +46,11 @@ import ch.qos.logback.core.Context;
 import ch.qos.logback.core.FileAppender;
 import ch.qos.logback.core.rolling.RollingPolicyBase;
 import ch.qos.logback.core.rolling.helper.FileNamePattern;
-
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentMatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -152,6 +156,46 @@ public class RollingPolicyDecoratorTest extends UnitTestBase
         _policy.rollover();
         verify(_delegate, times(2)).rollover();
         verify(_listener).onNoRolloverDetected(eq(_baseFolder.toPath()), argThat(matcher));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testFirstRolloverRescansUntilArchiveAppears(final boolean existingArchive) throws IOException
+    {
+        if (!existingArchive)
+        {
+            Files.delete(_testFile.toPath());
+        }
+        final Queue<Runnable> scans = new ArrayDeque<>();
+        final ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+        doAnswer(invocation ->
+        {
+            scans.add(invocation.getArgument(0));
+            return null;
+        }).when(executor).execute(any(Runnable.class));
+        doAnswer(invocation ->
+        {
+            scans.add(invocation.getArgument(0));
+            return null;
+        }).when(executor).schedule(any(Runnable.class), any(long.class), any(TimeUnit.class));
+        _policy = new RollingPolicyDecorator(_delegate, _listener, executor);
+        _policy.start();
+        _policy.rollover();
+
+        // The archive is still being compressed when the first rollover scan runs.
+        final int initialScanCount = scans.size();
+        for (int i = 0; i < initialScanCount; i++)
+        {
+            scans.remove().run();
+        }
+        assertEquals(1, scans.size(), "The first rollover must keep scanning until its archive appears");
+
+        final File archive = createTestFile("test.2015-06-25.1.gz");
+        scans.remove().run();
+        final String[] expected = existingArchive ? new String[]{_testFile.getName(), archive.getName()} :
+                new String[]{archive.getName()};
+        verify(_listener).onRollover(eq(_baseFolder.toPath()), argThat(getMatcher(expected)));
+        assertTrue(scans.isEmpty(), "A detected rollover must stop rescanning");
     }
 
     @Test
