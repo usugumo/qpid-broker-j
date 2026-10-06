@@ -24,7 +24,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -42,19 +46,24 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
+import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.encoder.PatternLayoutEncoder;
 import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.classic.turbo.TurboFilter;
 import ch.qos.logback.classic.util.LogbackMDCAdapter;
 import ch.qos.logback.core.rolling.RollingFileAppender;
 import ch.qos.logback.core.rolling.RolloverFailure;
 import ch.qos.logback.core.rolling.TimeBasedRollingPolicy;
+import ch.qos.logback.core.spi.FilterReply;
 import ch.qos.logback.core.status.Status;
+import ch.qos.logback.core.status.StatusListener;
 import ch.qos.logback.core.util.FileSize;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -62,7 +71,10 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
+import org.slf4j.Marker;
 
+import org.apache.qpid.server.model.SystemConfig;
 import org.apache.qpid.test.utils.UnitTestBase;
 
 class DailyTriggeringPolicyTest extends UnitTestBase
@@ -310,6 +322,95 @@ class DailyTriggeringPolicyTest extends UnitTestBase
         assertEquals("oldduring-failureduring-backoff",
                 Files.readString(archiveDirectory.resolve("broker.log." + TODAY + ".0")));
         assertEquals("recovered", Files.readString(_activeFile));
+    }
+
+    @Test
+    void archiveScanFailureDoesNotReenterThroughStatusListener() throws IOException
+    {
+        final Path archiveDirectory = Files.createDirectory(_directory.resolve("archives"));
+        writeActive("old", NOW);
+        final BrokerFileLogger<?> brokerLogger = mock(BrokerFileLogger.class);
+        final SystemConfig<?> systemConfig = mock(SystemConfig.class);
+        when(brokerLogger.getContextValue(Boolean.class, BrokerFileLogger.BROKER_FAIL_ON_LOGGER_IO_ERROR))
+                .thenReturn(false);
+        final BrokerLoggerStatusListener listener = new BrokerLoggerStatusListener(brokerLogger, systemConfig,
+                BrokerFileLogger.BROKER_FAIL_ON_LOGGER_IO_ERROR, IOException.class);
+
+        try (final TestAppender appender = new TestAppender(false, false))
+        {
+            appender._rollingPolicy.setFileNamePattern(archiveDirectory.resolve("broker.log") +
+                    ".%d{yyyy-MM-dd,UTC}.%i");
+            appender.start();
+            final AtomicInteger errors = new AtomicInteger();
+            final StatusListener boundedListener = status ->
+            {
+                if (status.getOrigin() == appender._triggeringPolicy && status.getLevel() == Status.ERROR)
+                {
+                    // Bound forwarding so recursion fails an assertion instead of overflowing the stack.
+                    if (errors.incrementAndGet() == 1)
+                    {
+                        listener.addStatusEvent(status);
+                    }
+                }
+            };
+            final Logger statusLogger = (Logger) LoggerFactory.getLogger(BrokerLoggerStatusListener.class);
+            final Level originalLevel = statusLogger.getLevel();
+            final boolean originalAdditive = statusLogger.isAdditive();
+            final TurboFilter statusFilter = new TurboFilter()
+            {
+                @Override
+                public FilterReply decide(final Marker marker, final Logger logger, final Level level,
+                                          final String format, final Object[] params, final Throwable throwable)
+                {
+                    return logger == statusLogger && level == Level.ERROR ? FilterReply.ACCEPT : FilterReply.NEUTRAL;
+                }
+            };
+            statusFilter.start();
+            // Broker filters installed by other tests must not suppress the listener's diagnostic.
+            statusLogger.getLoggerContext().getTurboFilterList().add(0, statusFilter);
+            statusLogger.setLevel(Level.ERROR);
+            statusLogger.setAdditive(false);
+            statusLogger.addAppender(appender._appender);
+            appender._context.getStatusManager().add(boundedListener);
+            try
+            {
+                Files.delete(archiveDirectory);
+                Files.writeString(archiveDirectory, "blocked");
+                appender._triggeringPolicy.setCurrentTime(NOW.plusSeconds(86400).toEpochMilli());
+                appender.append("during-failure");
+                assertEquals(1, errors.get(), "The listener must not recursively report the archive scan failure");
+                final String failureContent = Files.readString(_activeFile);
+                assertTrue(failureContent.contains("Unexpected error whilst trying to store log entry."));
+                assertTrue(failureContent.endsWith("during-failure"));
+
+                appender.append("during-backoff");
+                appender._triggeringPolicy.setCurrentTime(NOW.plusSeconds(86431).toEpochMilli());
+                appender.append("during-retry");
+                assertEquals(1, errors.get(), "Retries must not report the same failure again");
+                final String expectedArchive = failureContent + "during-backoffduring-retry";
+                assertEquals(expectedArchive, Files.readString(_activeFile));
+
+                Files.delete(archiveDirectory);
+                Files.createDirectory(archiveDirectory);
+                appender._triggeringPolicy.setCurrentTime(NOW.plusSeconds(86462).toEpochMilli());
+                appender.append("recovered");
+                assertEquals("recovered", Files.readString(_activeFile));
+                assertEquals(expectedArchive,
+                        Files.readString(archiveDirectory.resolve("broker.log." + TODAY + ".0")));
+                assertEquals(1, errors.get());
+                verify(brokerLogger, never()).stopLogging();
+                verify(systemConfig, never()).closeAsync();
+            }
+            finally
+            {
+                appender._context.getStatusManager().remove(boundedListener);
+                statusLogger.detachAppender(appender._appender);
+                statusLogger.getLoggerContext().getTurboFilterList().remove(statusFilter);
+                statusFilter.stop();
+                statusLogger.setLevel(originalLevel);
+                statusLogger.setAdditive(originalAdditive);
+            }
+        }
     }
 
     @Test

@@ -185,11 +185,12 @@ final class DailyTriggeringPolicy<E> extends ContextAwareBase implements TimeBas
         }
         catch (IOException | DirectoryIteratorException | ArithmeticException e)
         {
-            if (_retryAfter == 0)
+            final boolean reportError = _retryAfter == 0;
+            _retryAfter = now + RETRY_DELAY_MILLIS;
+            if (reportError)
             {
                 addError("Cannot determine a safe daily archive name; continuing to append and retrying later", e);
             }
-            _retryAfter = now + RETRY_DELAY_MILLIS;
         }
         return false;
     }
