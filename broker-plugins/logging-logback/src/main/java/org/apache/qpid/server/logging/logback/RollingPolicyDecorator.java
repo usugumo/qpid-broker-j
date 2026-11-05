@@ -65,15 +65,17 @@ public class RollingPolicyDecorator implements RollingPolicy
     private ScanTask _currentScanTask;
     private String[] _previousScanResults;
 
-    public RollingPolicyDecorator(RollingPolicyBase decorated, RolloverListener listener, ScheduledExecutorService executorService)
+    public RollingPolicyDecorator(final RollingPolicyBase decorated,
+                                  final RolloverListener listener,
+                                  final ScheduledExecutorService executorService)
     {
         _decorated = decorated;
         _listener = listener;
         _executorService = executorService;
 
-        String filePathPattern = _decorated.getFileNamePattern();
-        String filePathRegExp = new FileNamePattern(filePathPattern, _decorated.getContext()).toRegex();
-        FilePathBaseFolderAndPatternPair pair = new FilePathBaseFolderAndPatternPair(filePathRegExp);
+        final FileNamePattern fileNamePattern =
+                new FileNamePattern(_decorated.getFileNamePattern(), _decorated.getContext());
+        final FilePathBaseFolderAndPatternPair pair = new FilePathBaseFolderAndPatternPair(fileNamePattern);
         _rolledFilesBaseFolder = pair.getBaseFolder();
         _rolledFileRegExp = pair.getPattern();
         _currentScanTask = null;
@@ -226,13 +228,13 @@ public class RollingPolicyDecorator implements RollingPolicy
                     @Override
                     public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
                     {
-                        String absolutePath = file.toAbsolutePath().toString();
+                        String relativePath = _rolledFilesBaseFolder.relativize(file.toAbsolutePath()).toString();
                         if (File.separatorChar == '\\')
                         {
-                            absolutePath = absolutePath.replace('\\', '/');
+                            relativePath = relativePath.replace('\\', '/');
                         }
 
-                        if (_rolledFileRegExp.matcher(absolutePath).matches())
+                        if (_rolledFileRegExp.matcher(relativePath).matches())
                         {
                             rolledFiles.add(file);
                         }
@@ -290,26 +292,26 @@ public class RollingPolicyDecorator implements RollingPolicy
         private final Path _baseFolder;
         private final Pattern _pattern;
 
-        public FilePathBaseFolderAndPatternPair(String fileNamePattern)
+        public FilePathBaseFolderAndPatternPair(final FileNamePattern fileNamePattern)
         {
-            String path;
-            int firstDigitPatternPosition= fileNamePattern.indexOf("\\d");
-            if (firstDigitPatternPosition == -1)
+            final String filePathPattern = fileNamePattern.getPattern();
+            final String filePathRegExp = fileNamePattern.toRegex();
+            if (filePathRegExp.indexOf("\\d") == -1)
             {
-                throw new RuntimeException("Rolling policy file pattern does not seem to contain date or integer token");
+                throw new RuntimeException(
+                        "Rolling policy file pattern does not seem to contain date or integer token");
             }
-            int slashBeforeDigitPatternPosition = fileNamePattern.lastIndexOf("/", firstDigitPatternPosition);
-            if (slashBeforeDigitPatternPosition != -1)
-            {
-                path = fileNamePattern.substring(0, slashBeforeDigitPatternPosition);
-                fileNamePattern = fileNamePattern.substring( slashBeforeDigitPatternPosition + 1);
-            }
-            else
-            {
-                path = System.getProperty("user.dir");
-            }
+            // A regex may contain escaped path characters, so derive the directory from the original pattern.
+            final int firstTokenPosition = filePathPattern.indexOf('%');
+            final int slashBeforeTokenPosition = filePathPattern.lastIndexOf('/', firstTokenPosition);
+            final String directoryPattern = filePathPattern.substring(0, slashBeforeTokenPosition + 1);
+            final String path = directoryPattern.isEmpty() ? System.getProperty("user.dir") : directoryPattern;
             _baseFolder = new File(path).toPath().toAbsolutePath();
-            _pattern = Pattern.compile(Pattern.quote(path) + "/" + fileNamePattern);
+
+            // Remove the literal directory's regex to match paths relative to the scan directory.
+            final String directoryRegExp = directoryPattern.isEmpty() ? "" :
+                    new FileNamePattern(directoryPattern, fileNamePattern.getContext()).toRegex();
+            _pattern = Pattern.compile(filePathRegExp.substring(directoryRegExp.length()));
         }
 
         public Path getBaseFolder()
